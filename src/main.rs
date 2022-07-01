@@ -290,6 +290,7 @@ impl GitCommitCursor {
                     .unwrap();
                 self.repo_param = vals.get(0).map(|v| v.as_str().unwrap().to_string());
                 self.rev_param = vals.get(1).map(|v| v.as_str().unwrap().to_string());
+                println!("REPO PATH{:#?}", repo_path);
                 self.repo
                     .set(Repository::open(&repo_path)?)
                     .map_err(|_| rusqlite::Error::ModuleError("unable to set repo".to_string()))?;
@@ -394,7 +395,7 @@ unsafe impl<'a> VTab<'a> for GitStats {
         args: &[&[u8]],
     ) -> rusqlite::Result<(String, Self)> {
         Ok((
-            "create table stats(file_name text, additions integer, deletions integer, hash hidden, repo hidden)"
+            "create table stats(file_name text, additions integer, deletions integer, repo hidden, hash hidden)"
                 .to_string(),
             GitStats {
                 base: sqlite3_vtab::default(),
@@ -417,7 +418,9 @@ unsafe impl<'a> VTab<'a> for GitStats {
             counter += 1;
         });
 
+        used_cols.dedup();
         used_cols.sort();
+        println!("{:#?}", used_cols);
         let index_num = match &used_cols[..] {
             &[a, b] if a == 3 && b == 4 => RepoRevParam::BOTH_PASSED,
             &[a] if a == 3 => RepoRevParam::REPO_PASSED,
@@ -581,11 +584,12 @@ unsafe impl VTabCursor for GitStatsCursor {
         idx_str: Option<&str>,
         args: &Values<'_>,
     ) -> rusqlite::Result<()> {
+        self.repo = OnceCell::new();
         let vals = args
             .iter()
             .map(|value_ref| value_ref.as_str().unwrap())
             .collect_vec();
-        println!("{:#?}", vals);
+        println!("{:#?} {:#?}", idx_num, vals);
         match idx_num {
             0 => {
                 self.repo_param = None;
@@ -625,9 +629,10 @@ unsafe impl VTabCursor for GitStatsCursor {
             }
             3 => {
                 let repo_path = vals.first().map(|v| v.to_string()).unwrap();
+                println!("REPO PATH {:#?}", repo_path);
                 self.repo_param = vals.get(0).map(|v| v.to_string());
                 self.rev_param = vals.get(1).map(|v| v.to_string());
-                self.repo
+                self.repo // THe once cell is for the entire execution so that wont work. Apparently we need to reset the cursor when it is finished.
                     .set(Repository::open(&repo_path).unwrap())
                     .map_err(|_| rusqlite::Error::ModuleError("unable to set repo".to_string()))?;
                 self.hash = self.rev_param.as_ref().unwrap().to_string();
@@ -683,6 +688,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod test {
+    use crate::utils::execute_and_pretty_print;
     use crate::{GitCommit, GitStats};
     use chrono::{DateTime, TimeZone, Utc};
     use itertools::assert_equal;
@@ -747,8 +753,14 @@ mod test {
         db.create_module("commits", commit_module, None).unwrap();
         db.create_module("stats", stat_module, None).unwrap();
 
-        let sql = r#"SELECT hash, message, author_when, file_name, additions, deletions FROM commits('./tests') JOIN stats('./tests', '9096bf0343aecaa4a592da68c10874fd9fe35918') ON hash = commit_hash ORDER BY author_when ASC"#;
+        let sql = r#"
+        SELECT c.hash, message, author_when, file_name, additions, deletions
+        FROM commits('./tests') c 
+            LEFT OUTER JOIN stats('./tests') s ON c.hash = s.hash 
+        ORDER BY author_when DESC"#;
+
         let mut stmt = db.prepare(sql)?;
+
         let mut query_res = stmt.query([])?;
         let row = query_res.next()?.unwrap();
 
@@ -761,10 +773,10 @@ mod test {
 
         assert_eq!(
             hash,
-            String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882")
+            String::from("9096bf0343aecaa4a592da68c10874fd9fe35918")
         );
-        assert_eq!(msg, "First commit\n");
-        assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(17, 55, 57));
+        assert_eq!(msg, "More lines\n");
+        assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(18, 34, 30));
         assert_eq!(filename, String::from("hello.txt"));
         assert_eq!(additions, 1);
         assert_eq!(deletions, 0);
