@@ -1,15 +1,12 @@
 #![feature(once_cell)]
 
+mod utils;
+
 extern crate core;
 
 use std::panic;
 
 use chrono::{DateTime, TimeZone, Utc};
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use git2::{
     Branch, BranchType, Commit, Delta, Deltas, DescribeOptions, Diff, DiffDelta, DiffHunk,
     DiffLine, DiffLineType, DiffOptions, Error, Oid, ReflogEntry, Repository, Revwalk, Sort,
@@ -35,38 +32,84 @@ use std::ops::Add;
 use std::os::raw::c_int;
 use std::ptr::null;
 use std::sync::Arc;
-use tui::widgets::{Row, Table};
-use tui::{
-    backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-    Frame, Terminal,
-};
+use crate::utils::list_commits_with_stats;
 
-#[repr(C)]
-struct GitCommit {
-    base: sqlite3_vtab,
-}
+//  Shared -------------------------------------------------------------------------------------------------
 
 #[derive(FromPrimitive)]
-enum GitCommitParams {
+enum RepoRevParam {
     NONE_PASSED = 0,
     REV_PASSED = 1,
     REPO_PASSED = 2,
     BOTH_PASSED = 3,
 }
 
-impl Into<c_int> for GitCommitParams {
+impl Into<c_int> for RepoRevParam {
     fn into(self) -> c_int {
         match self {
-            GitCommitParams::NONE_PASSED => 0,
-            GitCommitParams::REV_PASSED => 1,
-            GitCommitParams::REPO_PASSED => 2,
-            GitCommitParams::BOTH_PASSED => 3,
+            RepoRevParam::NONE_PASSED => 0,
+            RepoRevParam::REV_PASSED => 1,
+            RepoRevParam::REPO_PASSED => 2,
+            RepoRevParam::BOTH_PASSED => 3,
         }
     }
+}
+
+#[derive(Debug)]
+enum CustomError {
+    git(git2::Error),
+    sqlite(rusqlite::Error),
+}
+
+impl CustomError {
+    fn to_sqlite_error(self) -> rusqlite::Error {
+        match self {
+            CustomError::git(g) => rusqlite::Error::ModuleError(g.message().to_string()),
+            CustomError::sqlite(s) => s,
+        }
+    }
+}
+
+impl Into<rusqlite::Error> for CustomError {
+    fn into(self) -> rusqlite::Error {
+        match self {
+            CustomError::git(g) => rusqlite::Error::ModuleError(g.message().to_string()),
+            CustomError::sqlite(s) => s,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for CustomError {
+    fn from(e: rusqlite::Error) -> Self {
+        CustomError::sqlite(e)
+    }
+}
+
+impl From<git2::Error> for CustomError {
+    fn from(e: Error) -> Self {
+        CustomError::git(e)
+    }
+}
+
+fn print_index_info(info: &mut IndexInfo) {
+    println!("-- INDEX INFO --");
+    for x in info.constraints() {
+        println!("is_usable: {:#?}", x.is_usable());
+        println!("operator: {:#?}", x.operator());
+        println!("column: {:#?}", x.column());
+    }
+    println!("-- END OF INDEX INFO --");
+}
+
+fn to_sqlite_error(git_error: git2::Error) -> rusqlite::Error {
+    rusqlite::Error::ModuleError(git_error.message().to_string())
+}
+
+// COmmits --------------------------------------------------------------------------------------------------
+
+#[repr(C)]
+struct GitCommit {
+    base: sqlite3_vtab,
 }
 
 unsafe impl<'a> VTab<'a> for GitCommit {
@@ -120,11 +163,11 @@ unsafe impl<'a> VTab<'a> for GitCommit {
 
         used_cols.sort();
         let index_num = match &used_cols[..] {
-            &[a, b] if a == 11 && b == 12 => GitCommitParams::BOTH_PASSED,
-            &[a] if a == 11 => GitCommitParams::REPO_PASSED,
-            &[a] if a == 12 => GitCommitParams::REV_PASSED,
-            &[] => GitCommitParams::NONE_PASSED,
-            _ => GitCommitParams::NONE_PASSED,
+            &[a, b] if a == 11 && b == 12 => RepoRevParam::BOTH_PASSED,
+            &[a] if a == 11 => RepoRevParam::REPO_PASSED,
+            &[a] if a == 12 => RepoRevParam::REV_PASSED,
+            &[] => RepoRevParam::NONE_PASSED,
+            _ => RepoRevParam::NONE_PASSED,
         };
 
         info.set_idx_num(index_num.into());
@@ -334,26 +377,11 @@ unsafe impl VTabCursor for GitCommitCursor {
     }
 }
 
+//  STATS ------------------------------------------------------------------------------------------------
+
 #[repr(C)]
 struct GitStats {
-    base: sqlite3_vtab,
-    repo: Repository,
-    hash: String,
-    map: HashMap<String, (u64, u64)>,
-}
-
-fn print_index_info(info: &mut IndexInfo) {
-    println!("-- INDEX INFO --");
-    for x in info.constraints() {
-        println!("is_usable: {:#?}", x.is_usable());
-        println!("operator: {:#?}", x.operator());
-        println!("column: {:#?}", x.column());
-    }
-    println!("-- END OF INDEX INFO --");
-}
-
-fn to_sqlite_error(git_error: git2::Error) -> rusqlite::Error {
-    rusqlite::Error::ModuleError(git_error.message().to_string())
+    base: sqlite3_vtab
 }
 
 unsafe impl<'a> VTab<'a> for GitStats {
@@ -365,35 +393,40 @@ unsafe impl<'a> VTab<'a> for GitStats {
         aux: Option<&Self::Aux>,
         args: &[&[u8]],
     ) -> rusqlite::Result<(String, Self)> {
-        let repo = Repository::open(".").map_err(to_sqlite_error)?;
-        let mut revwalk = repo.revwalk().map_err(to_sqlite_error)?;
-        revwalk.push_head().map_err(to_sqlite_error)?;
-        let head_had = revwalk
-            .next()
-            .unwrap()
-            .map_err(to_sqlite_error)?
-            .to_string();
         Ok((
-            "create table stats(file_name text, additions integer, deletions integer, hash hidden)"
+            "create table stats(file_name text, additions integer, deletions integer, hash hidden, repo hidden)"
                 .to_string(),
             GitStats {
                 base: sqlite3_vtab::default(),
-                repo: Repository::open(".").map_err(to_sqlite_error)?,
-                hash: head_had,
-                map: Default::default(),
             },
         ))
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+        print_index_info(info);
         let mut counter = 0;
-        let usable_constraints = &info.constraints().filter(|con| con.is_usable()).count();
+        let mut used_cols = info
+            .constraints()
+            .filter(|con| con.is_usable())
+            .map(|con| con.column())
+            .collect_vec();
 
-        (0..usable_constraints.to_i16().unwrap()).for_each(|_| {
+        (0..used_cols.len()).for_each(|_| {
             let mut usage = &mut info.constraint_usage(counter);
             usage.set_argv_index((counter + 1) as c_int);
             counter += 1;
         });
+
+        used_cols.sort();
+        let index_num = match &used_cols[..] {
+            &[a, b] if a == 3 && b == 4 => RepoRevParam::BOTH_PASSED,
+            &[a] if a == 3 => RepoRevParam::REPO_PASSED,
+            &[a] if a == 4 => RepoRevParam::REV_PASSED,
+            &[] => RepoRevParam::NONE_PASSED,
+            _ => RepoRevParam::NONE_PASSED,
+        };
+
+        info.set_idx_num(index_num.into());
 
         Ok(())
     }
@@ -403,8 +436,10 @@ unsafe impl<'a> VTab<'a> for GitStats {
             base: Default::default(),
             diffs: vec![],
             i: 0,
-            hash: self.hash.to_string(),
-            repo: Repository::open("/home/rdp/dixa/listing-service").unwrap(),
+            hash: "".to_string(),
+            repo: OnceCell::new(),
+            repo_param: None,
+            rev_param: None
         })
     }
 }
@@ -415,7 +450,9 @@ struct GitStatsCursor {
     diffs: Vec<(String, u64, u64)>,
     i: usize,
     hash: String,
-    repo: Repository,
+    repo: OnceCell<Repository>,
+    repo_param: Option<String>,
+    rev_param: Option<String>,
 }
 
 impl Debug for GitStatsCursor {
@@ -428,58 +465,25 @@ impl Debug for GitStatsCursor {
     }
 }
 
-enum CustomError {
-    git(git2::Error),
-    sqlite(rusqlite::Error),
-}
-
-impl CustomError {
-    fn to_sqlite_error(self) -> rusqlite::Error {
-        match self {
-            CustomError::git(g) => rusqlite::Error::ModuleError(g.message().to_string()),
-            CustomError::sqlite(s) => s,
-        }
-    }
-}
-
-impl Into<rusqlite::Error> for CustomError {
-    fn into(self) -> rusqlite::Error {
-        match self {
-            CustomError::git(g) => rusqlite::Error::ModuleError(g.message().to_string()),
-            CustomError::sqlite(s) => s,
-        }
-    }
-}
-
-impl From<rusqlite::Error> for CustomError {
-    fn from(e: rusqlite::Error) -> Self {
-        CustomError::sqlite(e)
-    }
-}
-
-impl From<git2::Error> for CustomError {
-    fn from(e: Error) -> Self {
-        CustomError::git(e)
-    }
-}
 
 impl GitStatsCursor {
     fn compute_diff(&self) -> Result<Vec<(String, u64, u64)>, CustomError> {
-        let commit = self.repo.find_commit(Oid::from_str(&self.hash)?)?;
+        let commit = self.repo.get().unwrap().find_commit(Oid::from_str(&self.hash)?)?;
+        println!("{:#?}",commit);
         let (tree, parent_tree) = match commit.parent_count() {
             1 => {
-                let tree = self.repo.find_tree(commit.tree_id())?;
-                let parent_tree = self.repo.find_tree(commit.parent(0)?.tree_id())?;
+                let tree = self.repo.get().unwrap().find_tree(commit.tree_id())?;
+                let parent_tree = self.repo.get().unwrap().find_tree(commit.parent(0)?.tree_id())?;
                 (tree, parent_tree)
             }
             2 => {
-                let tree = self.repo.find_tree(commit.parent(1)?.tree_id())?;
-                let parent_tree = self.repo.find_tree(commit.parent(0)?.tree_id())?;
+                let tree = self.repo.get().unwrap().find_tree(commit.parent(1)?.tree_id())?;
+                let parent_tree = self.repo.get().unwrap().find_tree(commit.parent(0)?.tree_id())?;
                 (tree, parent_tree)
             }
             0 => {
-                let tree = self.repo.find_tree(commit.tree_id())?;
-                let tree2 = self.repo.find_tree(commit.tree_id())?;
+                let tree = self.repo.get().unwrap().find_tree(commit.tree_id())?;
+                let tree2 = self.repo.get().unwrap().find_tree(commit.tree_id())?;
                 (tree, tree2)
             }
             _ => {
@@ -498,7 +502,7 @@ impl GitStatsCursor {
             .ignore_whitespace_change(true);
 
         let diff =
-            self.repo
+            self.repo.get().unwrap()
                 .diff_tree_to_tree(Some(&parent_tree), Some(&tree), Some(&mut diff_options));
         let mut map: HashMap<String, (u64, u64)> = HashMap::new();
         let mut line_cb =
@@ -560,12 +564,52 @@ unsafe impl VTabCursor for GitStatsCursor {
         idx_str: Option<&str>,
         args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        args.iter().for_each(|arg| {
-            self.hash = arg.as_str().unwrap().to_string();
-        });
-
-        self.diffs = self.compute_diff().map_err(|e| e.to_sqlite_error())?;
-        self.i = 0;
+        let vals = args.iter().map(|value_ref| value_ref.as_str().unwrap()).collect_vec();
+        println!("{:#?}",vals);
+        match idx_num {
+            0 => {
+                self.repo_param = None;
+                self.rev_param = None;
+                self.repo.set(Repository::open(".").unwrap());
+                self.hash = self.repo.get().unwrap().head().unwrap().target().unwrap().to_string();
+                self.i = 0;
+            }
+            1 => {
+                self.repo_param = None;
+                self.rev_param = vals
+                    .first()
+                    .map(|v| v.to_string());
+                self.hash = self.rev_param.as_ref().unwrap().to_string();
+                self.repo.set(Repository::open(".").unwrap());
+            }
+            2 => {
+                let repo_path = vals
+                    .first()
+                    .map(|v| v.to_string())
+                    .unwrap();
+                self.repo_param = Some(repo_path.to_owned());
+                self.rev_param = None;
+                self.repo.set(Repository::open(&repo_path).unwrap());
+                self.hash = self.repo.get().unwrap().head().unwrap().target().unwrap().to_string();
+            }
+            3 => {
+                let repo_path = vals
+                    .first()
+                    .map(|v| v.to_string())
+                    .unwrap();
+                self.repo_param = vals.get(0)
+                    .map(|v| v.to_string());
+                self.rev_param = vals.get(1).map(|v| v.to_string());
+                self.repo
+                    .set(Repository::open(&repo_path).unwrap())
+                    .map_err(|_| rusqlite::Error::ModuleError("unable to set repo".to_string()))?;
+                self.hash = self.rev_param.as_ref().unwrap().to_string();
+            }
+            _ => (),
+        }
+        self.diffs = self.compute_diff().unwrap();
+        println!("{:#?} {:#?}",self.rev_param, self.repo_param);
+        println!("{:#?}",self.diffs);
         Ok(())
     }
 
@@ -584,7 +628,8 @@ unsafe impl VTabCursor for GitStatsCursor {
             0 => ctx.set_result(filename),
             1 => ctx.set_result(additions),
             2 => ctx.set_result(deletions),
-            3 => ctx.set_result(&self.hash.to_string()),
+            3 => ctx.set_result(&self.repo_param.as_ref().unwrap()),
+            4 => ctx.set_result(&self.rev_param.as_ref().unwrap()),
             _ => Ok(()),
         }
     }
@@ -594,227 +639,8 @@ unsafe impl VTabCursor for GitStatsCursor {
     }
 }
 
-/**
-hash            text, 0
-message         text, 1
-author_name     text, 2
-author_email    text, 3
-author_when     DATETIME, 4
-committer_name  text, 5
-committer_email text, 6
-committer_when  DATETIME, 7
-is_merge        bool, 8
-parent_1        text, 9
-parent_2        text, 10
-repository      hidden, 11
-ref             hidden 12
- */
-fn list_all_comits(db: &Connection) {
-    let sql = r#"
-    SELECT hash, message, author_when
-    FROM commits('/home/rdp/dixa/listing-service')
-    "#;
-    let mut stmt = db.prepare(sql).unwrap();
+// MAIN ----------------------------------------------------------------------------------------------------------------
 
-    execute_and_pretty_print(&mut stmt);
-}
-
-fn execute_and_format(stmt: &mut Statement) -> Vec<String> {
-    let col_count = stmt.column_count();
-    let result_rows = stmt
-        .query_map([], |row| {
-            let mut row_array: Vec<String> = vec![];
-            (0..col_count).for_each(|i| {
-                let col_ref = row.get_ref_unwrap(i);
-                match col_ref.data_type() {
-                    Type::Null => {
-                        row_array.push("NULL".to_string());
-                        //row_str.push_str("NULL");
-                    }
-                    Type::Integer => {
-                        row_array.push(col_ref.as_i64().unwrap().to_string());
-                    }
-                    Type::Real => {
-                        row_array.push(col_ref.as_f64().unwrap().to_string());
-                    }
-                    Type::Text => {
-                        row_array.push(col_ref.as_str().unwrap().to_string().lines().join(""));
-                    }
-                    Type::Blob => {
-                        row_array.push(
-                            String::from_utf8(Vec::from(col_ref.as_blob().unwrap())).unwrap(),
-                        );
-                    }
-                };
-            });
-            Ok(row_array)
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect_vec();
-
-    let mut init = (0..col_count).map(|_| 0).collect_vec();
-    let col_names = stmt
-        .column_names()
-        .iter()
-        .map(|str| str.to_string())
-        .collect_vec();
-    let col_names_and_rows = [vec![col_names.to_owned()], result_rows.to_owned()].concat();
-    let max_size = col_names_and_rows.iter().fold(init, |mut acc, vec| {
-        (0..col_count).for_each(|i| {
-            if acc[i] < vec[i].len() {
-                acc[i] = std::cmp::min(vec[i].len(), 50)
-            }
-        });
-        acc
-    });
-
-    let headers = {
-        (0..col_count)
-            .map(|(i)| {
-                let max_size = max_size[i];
-                let mut str: String = col_names[i].to_owned();
-                let length = std::cmp::min(std::cmp::max(max_size, str.len()), 50);
-                str.truncate(length);
-                format!("{:width$}", str, width = length as usize)
-            })
-            .join(" | ")
-    };
-
-    let line = {
-        let lenth =
-            (0..col_count).fold(0, |acc, next| acc + max_size[next]) + 2 + (col_count * 3) - 1;
-        format!(
-            "{}",
-            String::from((0..lenth).map(|_| '-').collect::<String>())
-        )
-    };
-
-    let formatted_rows = result_rows
-        .iter()
-        .enumerate()
-        .flat_map(|(i, row_vec)| {
-            print!("| ");
-            let cols = (0..col_count)
-                .map(|(i)| {
-                    let max_size = max_size[i];
-                    let mut str: String = row_vec[i].to_owned();
-                    let length = std::cmp::min(std::cmp::max(max_size, str.len()), 50);
-                    str.truncate(length);
-                    format!("{:width$}", str, width = length as usize)
-                })
-                .join(" | ");
-            println!("");
-            if i == 0 {
-                let lenth =
-                    (0..col_count).fold(0, |acc, next| acc + max_size[next]) + 2 + (col_count * 3)
-                        - 1;
-                println!(
-                    "{}",
-                    String::from((0..lenth).map(|_| '-').collect::<String>())
-                );
-            }
-
-            let line = format!("|{}|", cols);
-
-            vec![line]
-        })
-        .collect_vec();
-
-    [vec![headers], vec![line], formatted_rows].concat()
-}
-
-fn execute_and_pretty_print(stmt: &mut Statement) {
-    let col_count = stmt.column_count();
-    let result_rows = stmt
-        .query_map([], |row| {
-            let mut row_array: Vec<String> = vec![];
-            (0..col_count).for_each(|i| {
-                let col_ref = row.get_ref_unwrap(i);
-                match col_ref.data_type() {
-                    Type::Null => {
-                        row_array.push("NULL".to_string());
-                        //row_str.push_str("NULL");
-                    }
-                    Type::Integer => {
-                        row_array.push(col_ref.as_i64().unwrap().to_string());
-                    }
-                    Type::Real => {
-                        row_array.push(col_ref.as_f64().unwrap().to_string());
-                    }
-                    Type::Text => {
-                        row_array.push(col_ref.as_str().unwrap().to_string().lines().join(""));
-                    }
-                    Type::Blob => {
-                        row_array.push(
-                            String::from_utf8(Vec::from(col_ref.as_blob().unwrap())).unwrap(),
-                        );
-                    }
-                };
-            });
-            Ok(row_array)
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect_vec();
-
-    let mut init = (0..col_count).map(|_| 0).collect_vec();
-    let col_names = stmt
-        .column_names()
-        .iter()
-        .map(|str| str.to_string())
-        .collect_vec();
-    let col_names_and_rows = [vec![col_names], result_rows].concat();
-    let max_size = col_names_and_rows.iter().fold(init, |mut acc, vec| {
-        (0..col_count).for_each(|i| {
-            if acc[i] < vec[i].len() {
-                acc[i] = std::cmp::min(vec[i].len(), 50)
-            }
-        });
-        acc
-    });
-
-    col_names_and_rows
-        .iter()
-        .enumerate()
-        .for_each(|(i, row_vec)| {
-            print!("| ");
-            (0..col_count).for_each(|(i)| {
-                let max_size = max_size[i];
-                let mut str: String = row_vec[i].to_owned();
-                let length = std::cmp::min(std::cmp::max(max_size, str.len()), 50);
-                str.truncate(length);
-                print!("{}", format!("{:width$}", str, width = length as usize));
-                print!(" | ");
-            });
-            println!("");
-            if i == 0 {
-                let lenth =
-                    (0..col_count).fold(0, |acc, next| acc + max_size[next]) + 2 + (col_count * 3)
-                        - 1;
-                println!(
-                    "{}",
-                    String::from((0..lenth).map(|_| '-').collect::<String>())
-                );
-            }
-        });
-
-    //println!("{:#?}", wut);
-}
-
-fn list_commits_with_stats(db: &Connection) {
-    let sql = r#"
-    SELECT commits.hash, stats.file_name, SUM(stats.additions), SUM(stats.deletions)
-    FROM commits('/home/rdp/dixa/listing-service') left outer join stats() on commits.hash = stats.hash
-    WHERE commits.is_merge is true
-    group by commits.hash, stats.file_name
-    "#;
-    let mut stmt = db.prepare(sql).unwrap();
-    let start = std::time::Instant::now();
-    execute_and_pretty_print(&mut stmt);
-
-    //println!("{:#?}", iter.collect_vec());
-}
 
 fn main() -> std::io::Result<()> {
     let db = Connection::open_in_memory().unwrap();
@@ -827,4 +653,60 @@ fn main() -> std::io::Result<()> {
     // list_all_comits(&db);
     list_commits_with_stats(&db);
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use chrono::{DateTime, TimeZone, Utc};
+    use itertools::assert_equal;
+    use rusqlite::Connection;
+    use rusqlite::vtab::eponymous_only_module;
+    use crate::{GitCommit, GitStats};
+
+    #[test]
+    fn commits() -> Result<(), rusqlite::Error> {
+        let db = Connection::open_in_memory().unwrap();
+        let commit_module = eponymous_only_module::<GitCommit>();
+        db.create_module("commits", commit_module, None).unwrap();
+
+        let sql = r#"
+    SELECT hash, message, author_when
+    FROM commits('./tests') ORDER BY author_when ASC;
+    "#;
+        let mut stmt = db.prepare(sql)?;
+        let mut query_res = stmt.query([])?;
+        let mut row = query_res.next()?.unwrap();
+
+        let hash: String = row.get(0).unwrap();
+        let msg: String = row.get(1).unwrap();
+        let when: DateTime<Utc> = row.get(2).unwrap();
+
+        assert_eq!(hash, String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882"));
+        assert_eq!(msg, "First commit\n");
+        assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(17, 55, 57));
+
+        Ok(())
+    }
+
+    #[test]
+    fn stats() -> Result<(), rusqlite::Error> {
+        let db = Connection::open_in_memory().unwrap();
+        let stat_module = eponymous_only_module::<GitStats>();
+        db.create_module("stats", stat_module, None).unwrap();
+
+        let sql = r#"SELECT file_name, additions, deletions FROM stats('./tests', '9096bf0343aecaa4a592da68c10874fd9fe35918')"#;
+        let mut stmt = db.prepare(sql)?;
+        let mut query_res = stmt.query([])?;
+        let mut row = query_res.next()?.unwrap();
+
+        let filename: String = row.get(0).unwrap();
+        let additions: i64 = row.get(1).unwrap();
+        let deletions: i64 = row.get(2).unwrap();
+
+        assert_eq!(filename, String::from("hello.txt"));
+        assert_eq!(additions, 1);
+        assert_eq!(deletions, 0);
+
+        Ok(())
+    }
 }
