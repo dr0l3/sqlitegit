@@ -738,4 +738,37 @@ mod test {
 
         Ok(())
     }
+
+    #[test]
+    fn combined() -> Result<(), rusqlite::Error> {
+        let db = Connection::open_in_memory().unwrap();
+        let commit_module = eponymous_only_module::<GitCommit>();
+        let stat_module = eponymous_only_module::<GitStats>();
+        db.create_module("commits", commit_module, None).unwrap();
+        db.create_module("stats", stat_module, None).unwrap();
+
+        let sql = r#"SELECT hash, message, author_when, file_name, additions, deletions FROM commits('./tests') JOIN stats('./tests', '9096bf0343aecaa4a592da68c10874fd9fe35918') ON hash = commit_hash ORDER BY author_when ASC"#;
+        let mut stmt = db.prepare(sql)?;
+        let mut query_res = stmt.query([])?;
+        let row = query_res.next()?.unwrap();
+
+        let hash: String = row.get(0).unwrap();
+        let msg: String = row.get(1).unwrap();
+        let when: DateTime<Utc> = row.get(2).unwrap();
+        let filename: String = row.get(3).unwrap();
+        let additions: i64 = row.get(4).unwrap();
+        let deletions: i64 = row.get(5).unwrap();
+
+        assert_eq!(
+            hash,
+            String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882")
+        );
+        assert_eq!(msg, "First commit\n");
+        assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(17, 55, 57));
+        assert_eq!(filename, String::from("hello.txt"));
+        assert_eq!(additions, 1);
+        assert_eq!(deletions, 0);
+
+        Ok(())
+    }
 }
