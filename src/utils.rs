@@ -1,6 +1,6 @@
 use itertools::Itertools;
-use rusqlite::{Connection, Statement};
 use rusqlite::types::Type;
+use rusqlite::{Connection, Statement};
 
 /**
 hash            text, 0
@@ -187,7 +187,7 @@ pub fn execute_and_pretty_print(stmt: &mut Statement) {
         .enumerate()
         .for_each(|(i, row_vec)| {
             print!("| ");
-            (0..col_count).for_each(|(i)| {
+            (0..col_count).for_each(|i| {
                 let max_size = max_size[i];
                 let mut str: String = row_vec[i].to_owned();
                 let length = std::cmp::min(std::cmp::max(max_size, str.len()), 50);

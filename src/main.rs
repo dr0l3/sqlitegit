@@ -6,6 +6,7 @@ extern crate core;
 
 use std::panic;
 
+use crate::utils::list_commits_with_stats;
 use chrono::{DateTime, TimeZone, Utc};
 use git2::{
     Branch, BranchType, Commit, Delta, Deltas, DescribeOptions, Diff, DiffDelta, DiffHunk,
@@ -32,7 +33,6 @@ use std::ops::Add;
 use std::os::raw::c_int;
 use std::ptr::null;
 use std::sync::Arc;
-use crate::utils::list_commits_with_stats;
 
 //  Shared -------------------------------------------------------------------------------------------------
 
@@ -381,7 +381,7 @@ unsafe impl VTabCursor for GitCommitCursor {
 
 #[repr(C)]
 struct GitStats {
-    base: sqlite3_vtab
+    base: sqlite3_vtab,
 }
 
 unsafe impl<'a> VTab<'a> for GitStats {
@@ -439,7 +439,7 @@ unsafe impl<'a> VTab<'a> for GitStats {
             hash: "".to_string(),
             repo: OnceCell::new(),
             repo_param: None,
-            rev_param: None
+            rev_param: None,
         })
     }
 }
@@ -465,20 +465,35 @@ impl Debug for GitStatsCursor {
     }
 }
 
-
 impl GitStatsCursor {
     fn compute_diff(&self) -> Result<Vec<(String, u64, u64)>, CustomError> {
-        let commit = self.repo.get().unwrap().find_commit(Oid::from_str(&self.hash)?)?;
-        println!("{:#?}",commit);
+        let commit = self
+            .repo
+            .get()
+            .unwrap()
+            .find_commit(Oid::from_str(&self.hash)?)?;
+        println!("{:#?}", commit);
         let (tree, parent_tree) = match commit.parent_count() {
             1 => {
                 let tree = self.repo.get().unwrap().find_tree(commit.tree_id())?;
-                let parent_tree = self.repo.get().unwrap().find_tree(commit.parent(0)?.tree_id())?;
+                let parent_tree = self
+                    .repo
+                    .get()
+                    .unwrap()
+                    .find_tree(commit.parent(0)?.tree_id())?;
                 (tree, parent_tree)
             }
             2 => {
-                let tree = self.repo.get().unwrap().find_tree(commit.parent(1)?.tree_id())?;
-                let parent_tree = self.repo.get().unwrap().find_tree(commit.parent(0)?.tree_id())?;
+                let tree = self
+                    .repo
+                    .get()
+                    .unwrap()
+                    .find_tree(commit.parent(1)?.tree_id())?;
+                let parent_tree = self
+                    .repo
+                    .get()
+                    .unwrap()
+                    .find_tree(commit.parent(0)?.tree_id())?;
                 (tree, parent_tree)
             }
             0 => {
@@ -501,9 +516,11 @@ impl GitStatsCursor {
             .ignore_whitespace_eol(true)
             .ignore_whitespace_change(true);
 
-        let diff =
-            self.repo.get().unwrap()
-                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), Some(&mut diff_options));
+        let diff = self.repo.get().unwrap().diff_tree_to_tree(
+            Some(&parent_tree),
+            Some(&tree),
+            Some(&mut diff_options),
+        );
         let mut map: HashMap<String, (u64, u64)> = HashMap::new();
         let mut line_cb =
             |diff_delta: DiffDelta, _: Option<DiffHunk>, line_dif: DiffLine| -> bool {
@@ -564,41 +581,51 @@ unsafe impl VTabCursor for GitStatsCursor {
         idx_str: Option<&str>,
         args: &Values<'_>,
     ) -> rusqlite::Result<()> {
-        let vals = args.iter().map(|value_ref| value_ref.as_str().unwrap()).collect_vec();
-        println!("{:#?}",vals);
+        let vals = args
+            .iter()
+            .map(|value_ref| value_ref.as_str().unwrap())
+            .collect_vec();
+        println!("{:#?}", vals);
         match idx_num {
             0 => {
                 self.repo_param = None;
                 self.rev_param = None;
                 self.repo.set(Repository::open(".").unwrap());
-                self.hash = self.repo.get().unwrap().head().unwrap().target().unwrap().to_string();
+                self.hash = self
+                    .repo
+                    .get()
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target()
+                    .unwrap()
+                    .to_string();
                 self.i = 0;
             }
             1 => {
                 self.repo_param = None;
-                self.rev_param = vals
-                    .first()
-                    .map(|v| v.to_string());
+                self.rev_param = vals.first().map(|v| v.to_string());
                 self.hash = self.rev_param.as_ref().unwrap().to_string();
                 self.repo.set(Repository::open(".").unwrap());
             }
             2 => {
-                let repo_path = vals
-                    .first()
-                    .map(|v| v.to_string())
-                    .unwrap();
+                let repo_path = vals.first().map(|v| v.to_string()).unwrap();
                 self.repo_param = Some(repo_path.to_owned());
                 self.rev_param = None;
                 self.repo.set(Repository::open(&repo_path).unwrap());
-                self.hash = self.repo.get().unwrap().head().unwrap().target().unwrap().to_string();
+                self.hash = self
+                    .repo
+                    .get()
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .target()
+                    .unwrap()
+                    .to_string();
             }
             3 => {
-                let repo_path = vals
-                    .first()
-                    .map(|v| v.to_string())
-                    .unwrap();
-                self.repo_param = vals.get(0)
-                    .map(|v| v.to_string());
+                let repo_path = vals.first().map(|v| v.to_string()).unwrap();
+                self.repo_param = vals.get(0).map(|v| v.to_string());
                 self.rev_param = vals.get(1).map(|v| v.to_string());
                 self.repo
                     .set(Repository::open(&repo_path).unwrap())
@@ -608,8 +635,8 @@ unsafe impl VTabCursor for GitStatsCursor {
             _ => (),
         }
         self.diffs = self.compute_diff().unwrap();
-        println!("{:#?} {:#?}",self.rev_param, self.repo_param);
-        println!("{:#?}",self.diffs);
+        println!("{:#?} {:#?}", self.rev_param, self.repo_param);
+        println!("{:#?}", self.diffs);
         Ok(())
     }
 
@@ -641,7 +668,6 @@ unsafe impl VTabCursor for GitStatsCursor {
 
 // MAIN ----------------------------------------------------------------------------------------------------------------
 
-
 fn main() -> std::io::Result<()> {
     let db = Connection::open_in_memory().unwrap();
     let commit_module = eponymous_only_module::<GitCommit>();
@@ -657,11 +683,11 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod test {
+    use crate::{GitCommit, GitStats};
     use chrono::{DateTime, TimeZone, Utc};
     use itertools::assert_equal;
-    use rusqlite::Connection;
     use rusqlite::vtab::eponymous_only_module;
-    use crate::{GitCommit, GitStats};
+    use rusqlite::Connection;
 
     #[test]
     fn commits() -> Result<(), rusqlite::Error> {
@@ -675,13 +701,16 @@ mod test {
     "#;
         let mut stmt = db.prepare(sql)?;
         let mut query_res = stmt.query([])?;
-        let mut row = query_res.next()?.unwrap();
+        let row = query_res.next()?.unwrap();
 
         let hash: String = row.get(0).unwrap();
         let msg: String = row.get(1).unwrap();
         let when: DateTime<Utc> = row.get(2).unwrap();
 
-        assert_eq!(hash, String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882"));
+        assert_eq!(
+            hash,
+            String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882")
+        );
         assert_eq!(msg, "First commit\n");
         assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(17, 55, 57));
 
@@ -697,7 +726,7 @@ mod test {
         let sql = r#"SELECT file_name, additions, deletions FROM stats('./tests', '9096bf0343aecaa4a592da68c10874fd9fe35918')"#;
         let mut stmt = db.prepare(sql)?;
         let mut query_res = stmt.query([])?;
-        let mut row = query_res.next()?.unwrap();
+        let row = query_res.next()?.unwrap();
 
         let filename: String = row.get(0).unwrap();
         let additions: i64 = row.get(1).unwrap();
