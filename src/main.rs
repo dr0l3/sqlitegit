@@ -10,7 +10,7 @@ use crate::utils::list_commits_with_stats;
 use chrono::{DateTime, TimeZone, Utc};
 use git2::{
     Branch, BranchType, Commit, Delta, Deltas, DescribeOptions, Diff, DiffDelta, DiffHunk,
-    DiffLine, DiffLineType, DiffOptions, Error, Oid, ReflogEntry, Repository, Revwalk, Sort,
+    DiffLine, DiffLineType, DiffOptions, Error, Oid, ReflogEntry, Repository, Revwalk, Sort, Time,
 };
 use itertools::Itertools;
 use num_derive::FromPrimitive;
@@ -23,6 +23,7 @@ use rusqlite::vtab::{
 };
 use rusqlite::{Column, Connection, ErrorCode, Statement};
 use std::any::Any;
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, RefMut};
 use std::collections::HashMap;
 use std::fmt::{format, Debug, Display, Formatter, Write};
@@ -32,7 +33,9 @@ use std::num::NonZeroUsize;
 use std::ops::Add;
 use std::os::raw::c_int;
 use std::ptr::null;
+use std::rc::Rc;
 use std::sync::Arc;
+use git2::ErrorClass::Repository;
 
 //  Shared -------------------------------------------------------------------------------------------------
 
@@ -290,7 +293,7 @@ impl GitCommitCursor {
                     .unwrap();
                 self.repo_param = vals.get(0).map(|v| v.as_str().unwrap().to_string());
                 self.rev_param = vals.get(1).map(|v| v.as_str().unwrap().to_string());
-                println!("REPO PATH{:#?}", repo_path);
+                //println!("REPO PATH{:#?}", repo_path);
                 self.repo
                     .set(Repository::open(&repo_path)?)
                     .map_err(|_| rusqlite::Error::ModuleError("unable to set repo".to_string()))?;
@@ -369,6 +372,309 @@ unsafe impl VTabCursor for GitCommitCursor {
             10 => ctx.set_result(&current_commit.parent_2),
             11 => ctx.set_result(&self.repo_param),
             12 => ctx.set_result(&self.rev_param),
+            _ => Ok(()),
+        }
+    }
+
+    fn rowid(&self) -> rusqlite::Result<i64> {
+        Ok(1)
+    }
+}
+//  Merges -----------------------------------------------------------------------------------------------
+
+#[repr(C)]
+struct GitCommitMerge {
+    base: sqlite3_vtab,
+}
+
+unsafe impl<'a> VTab<'a> for GitCommitMerge {
+    type Aux = ();
+    type Cursor = GitCommitMergeCursor;
+
+    fn connect(
+        db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        args: &[&[u8]],
+    ) -> rusqlite::Result<(String, Self)> {
+        let sql = r#"
+        create table merges (
+            hash            text primary key,
+            message         text,
+            author_name     text,
+            author_email    text,
+            author_when     DATETIME,
+            committer_name  text,
+            committer_email text,
+            committer_when  DATETIME,
+            parent_1        text,
+            parent_2        text,
+            time_to_merge   INTEGER,
+            time_of_first_commit DATETIME,
+            repository      hidden,
+            ref             hidden
+        ) WITHOUT ROWID
+        "#;
+        Ok((
+            sql.to_owned(),
+            GitCommitMerge {
+                base: sqlite3_vtab::default(),
+            },
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+        print_index_info(info);
+        let mut counter = 0;
+        let mut used_cols = info
+            .constraints()
+            .filter(|con| con.is_usable())
+            .map(|con| con.column())
+            .collect_vec();
+
+        (0..used_cols.len()).for_each(|_| {
+            let mut usage = &mut info.constraint_usage(counter);
+            usage.set_argv_index((counter + 1) as c_int);
+            counter += 1;
+        });
+
+        used_cols.sort();
+        let index_num = match &used_cols[..] {
+            &[a, b] if a == 12 && b == 13 => RepoRevParam::BOTH_PASSED,
+            &[a] if a == 12 => RepoRevParam::REPO_PASSED,
+            &[a] if a == 13 => RepoRevParam::REV_PASSED,
+            &[] => RepoRevParam::NONE_PASSED,
+            _ => RepoRevParam::NONE_PASSED,
+        };
+
+        info.set_idx_num(index_num.into());
+
+        Ok(())
+    }
+
+    fn open(&self) -> rusqlite::Result<GitCommitMergeCursor> {
+        Ok(GitCommitMergeCursor {
+            base: sqlite3_vtab_cursor::default(),
+            rev_param: None,
+            repo_param: None,
+            repo: OnceCell::new(),
+            walk: vec![],
+            i: 0,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CommitMergeShadow {
+    hash: String,
+    message: Option<String>,
+    author_name: Option<String>,
+    author_email: Option<String>,
+    author_when: DateTime<Utc>,
+    committer_name: Option<String>,
+    committer_email: Option<String>,
+    committer_when: DateTime<Utc>,
+    time_to_merge: i64,
+    parent_1: Option<String>,
+    parent_2: Option<String>,
+    time_of_first_commit: DateTime<Utc>,
+}
+
+#[repr(C)]
+struct GitCommitMergeCursor {
+    base: sqlite3_vtab_cursor,
+    rev_param: Option<String>,
+    repo_param: Option<String>,
+    repo: OnceCell<Repository>,
+    walk: Vec<CommitMergeShadow>,
+    i: usize,
+}
+
+impl GitCommitMergeCursor {
+    fn init(&mut self, idx_num: c_int, vals: Vec<ValueRef>) -> Result<(), CustomError> {
+        let all_commits: Vec<Commit> = match idx_num {
+            0 => {
+                self.repo_param = None;
+                self.rev_param = None;
+                self.repo.set(Repository::open(".")?);
+                let mut walk = self.repo.get().unwrap().revwalk()?;
+                walk.push_head()?;
+
+                walk.map(|oid| self.repo.get().unwrap().find_commit(oid.unwrap()).unwrap())
+                    .collect()
+            }
+            1 => {
+                self.repo_param = None;
+                self.rev_param = vals
+                    .first()
+                    .and_then(|v| v.as_str().ok())
+                    .map(|v| v.to_string());
+                self.repo.set(Repository::open(".").unwrap());
+                let commit_oid = Oid::from_str(&self.rev_param.as_ref().unwrap())?;
+                let mut walk = self.repo.get().unwrap().revwalk()?;
+                walk.push(commit_oid)?;
+                walk.map_ok(|oid| self.repo.get().unwrap().find_commit(oid).unwrap())
+                    .filter_map(|c| c.ok())
+                    .collect()
+            }
+            2 => {
+                let repo_path = vals
+                    .first()
+                    .and_then(|v| v.as_str().ok())
+                    .map(|v| v.to_string())
+                    .unwrap();
+                self.repo_param = Some(repo_path.to_owned());
+                self.rev_param = None;
+                self.repo.set(Repository::open(&repo_path)?);
+                let mut walk = self.repo.get().unwrap().revwalk()?;
+                walk.push_head()?;
+                walk.map_ok(|oid| self.repo.get().unwrap().find_commit(oid))
+                    .filter_map(|c| c.ok().and_then(|c| c.ok()))
+                    .collect()
+            }
+            3 => {
+                let repo_path = vals
+                    .first()
+                    .and_then(|v| v.as_str().ok())
+                    .map(|v| v.to_string())
+                    .unwrap();
+                self.repo_param = vals.get(0).map(|v| v.as_str().unwrap().to_string());
+                self.rev_param = vals.get(1).map(|v| v.as_str().unwrap().to_string());
+                //println!("REPO PATH{:#?}", repo_path);
+                self.repo
+                    .set(Repository::open(&repo_path)?)
+                    .map_err(|_| rusqlite::Error::ModuleError("unable to set repo".to_string()))?;
+                let commit_oid = Oid::from_str(&self.rev_param.as_ref().unwrap())?;
+                let mut walk = self.repo.get().unwrap().revwalk()?;
+                walk.push(commit_oid)?;
+                walk.map_ok(|oid| self.repo.get().unwrap().find_commit(oid))
+                    .filter_map(|c| c.ok().and_then(|c| c.ok()))
+                    .collect()
+            }
+            _ => vec![],
+        };
+
+        let merges: Vec<&Commit> = all_commits
+            .iter()
+            .filter(|c| c.parent_count() > 1)
+            .collect_vec();
+
+        //println!("MERGES::::::::: {:#?}", merges);
+
+        self.walk = merges
+            .iter()
+            .map(|c| {
+                let time_of_first_commit = get_time_of_first_commit(
+                    &c.parent(0).unwrap().id(),
+                    &c.parent(1).unwrap().id(),
+                    self.repo.get().unwrap(),
+                );
+                let time_to_merge = c.committer().when().seconds() - time_of_first_commit.seconds();
+                CommitMergeShadow {
+                    hash: c.id().to_string(),
+                    message: c.message().map(|msg| msg.to_string()),
+                    author_name: c.author().name().map(|name| name.to_string()),
+                    author_email: c.author().email().map(|email| email.to_string()),
+                    author_when: Utc.timestamp(c.author().when().seconds(), 0),
+                    committer_name: c.committer().name().map(|name| name.to_string()),
+                    committer_email: c.committer().email().map(|email| email.to_string()),
+                    committer_when: Utc.timestamp(c.committer().when().seconds(), 0),
+                    time_to_merge,
+                    parent_1: c.parent(0).map(|msg| msg.id().to_string()).ok(),
+                    parent_2: c.parent(1).map(|msg| msg.id().to_string()).ok(),
+                    time_of_first_commit: Utc.timestamp(time_of_first_commit.seconds(), 0),
+                }
+            })
+            .collect_vec();
+
+        Ok(())
+    }
+}
+
+fn get_time_of_first_commit(parent1: &Oid, parent2: &Oid, repo: &Repository) -> Time {
+    let mut earliest_commit = parent2.to_owned();
+    loop {
+        let commit = repo.find_commit(earliest_commit).unwrap();
+        match commit.parent(0) {
+            Ok(parent) => {
+                if parent.id() == *parent1
+                    || parent.committer().when().seconds()
+                        < repo
+                            .find_commit(*parent1)
+                            .unwrap()
+                            .committer()
+                            .when()
+                            .seconds()
+                {
+                    return commit.author().when();
+                }
+                earliest_commit = parent.id().to_owned();
+            }
+            Err(_) => return commit.committer().when(),
+        };
+    }
+}
+
+unsafe impl VTabCursor for GitCommitMergeCursor {
+    fn filter(
+        &mut self,
+        idx_num: c_int,
+        idx_str: Option<&str>,
+        args: &Values<'_>,
+    ) -> rusqlite::Result<()> {
+        let vals = args.iter().collect_vec();
+        self.init(idx_num, vals).map_err(|e| e.to_sqlite_error())?;
+
+        Ok(())
+    }
+
+    fn next(&mut self) -> rusqlite::Result<()> {
+        self.i = self.i + 1;
+
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        match self.rev_param {
+            None => self.i >= self.walk.len(),
+            Some(_) => self.i > 0,
+        }
+    }
+
+    /*
+    create table commits (
+            hash            text,
+            message         text,
+            author_name     text,
+            author_email    text,
+            author_when     DATETIME,
+            committer_name  text,
+            committer_email text,
+            committer_when  DATETIME,
+            is_merge        bool,
+            parent_1        text,
+            parent_2        text,
+            repository      hidden,
+            ref             hidden
+        ) WITHOUT ROWID
+
+     */
+    fn column(&self, ctx: &mut Context, i: c_int) -> rusqlite::Result<()> {
+        let current_commit = &self.walk[self.i];
+        match i {
+            0 => ctx.set_result(&current_commit.hash),
+            1 => ctx.set_result(&current_commit.message),
+            2 => ctx.set_result(&current_commit.author_name),
+            3 => ctx.set_result(&current_commit.author_email),
+            4 => ctx.set_result(&current_commit.author_when),
+            5 => ctx.set_result(&current_commit.committer_name),
+            6 => ctx.set_result(&current_commit.committer_email),
+            7 => ctx.set_result(&current_commit.committer_when),
+            8 => ctx.set_result(&current_commit.parent_1),
+            9 => ctx.set_result(&current_commit.parent_2),
+            10 => ctx.set_result(&current_commit.time_to_merge),
+            11 => ctx.set_result(&current_commit.time_of_first_commit),
+            12 => ctx.set_result(&self.repo_param),
+            13 => ctx.set_result(&self.rev_param),
             _ => Ok(()),
         }
     }
@@ -683,13 +989,18 @@ fn main() -> std::io::Result<()> {
 
     // list_all_comits(&db);
     list_commits_with_stats(&db);
+
+
+    let repo = git2::Repository::open(".");
+
+    repo?.revwalk()?.into_iter().map_ok(|c| c?.)
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
     use crate::utils::execute_and_pretty_print;
-    use crate::{GitCommit, GitStats};
+    use crate::{GitCommit, GitCommitMerge, GitStats};
     use chrono::{DateTime, TimeZone, Utc};
     use itertools::assert_equal;
     use rusqlite::vtab::eponymous_only_module;
@@ -820,6 +1131,73 @@ mod test {
         assert_eq!(filename, String::from("hello.txt"));
         assert_eq!(additions, 1);
         assert_eq!(deletions, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn repo_as_where() -> Result<(), rusqlite::Error> {
+        let db = Connection::open_in_memory().unwrap();
+        let commit_module = eponymous_only_module::<GitCommit>();
+        let stat_module = eponymous_only_module::<GitStats>();
+        db.create_module("commits", commit_module, None).unwrap();
+        db.create_module("stats", stat_module, None).unwrap();
+
+        let sql = r#"
+        SELECT c.hash, c.message, c.author_when
+        FROM commits() c
+        WHERE c.hash = "9096bf0343aecaa4a592da68c10874fd9fe35918" and c.repo = "./tests" 
+        ORDER BY author_when DESC"#;
+
+        let mut stmt = db.prepare(sql)?;
+
+        let mut query_res = stmt.query([])?;
+        let row = query_res.next()?.unwrap();
+
+        let hash: String = row.get(0).unwrap();
+        let msg: String = row.get(1).unwrap();
+        let when: DateTime<Utc> = row.get(2).unwrap();
+
+        assert_eq!(
+            hash,
+            String::from("9096bf0343aecaa4a592da68c10874fd9fe35918")
+        );
+        assert_eq!(msg, "More lines\n");
+        assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(18, 34, 30));
+
+        Ok(())
+    }
+
+    #[test]
+    fn merges() -> Result<(), rusqlite::Error> {
+        let db = Connection::open_in_memory().unwrap();
+        let commit_module = eponymous_only_module::<GitCommitMerge>();
+        let stat_module = eponymous_only_module::<GitStats>();
+        db.create_module("merges", commit_module, None).unwrap();
+        db.create_module("stats", stat_module, None).unwrap();
+
+        let sql = r#"
+    SELECT author_email, count(m.hash) as merges, AVG(time_to_merge/3600) as ttm, SUM(coalesce(additions, 0)) as additions, SUM(coalesce(deletions, 0)) as deletions
+    FROM merges('/home/rdp/dixa/conversation-service') m left join stats('/home/rdp/dixa/conversation-service') s on m.hash = s.hash
+    GROUP BY author_email
+    ORDER BY ttm ASC
+    "#;
+        let mut stmt = db.prepare(sql)?;
+        // let mut query_res = stmt.query([])?;
+
+        execute_and_pretty_print(&mut stmt);
+        // let row = query_res.next()?.unwrap();
+        //
+        // let hash: String = row.get(0).unwrap();
+        // let msg: String = row.get(1).unwrap();
+        // let when: DateTime<Utc> = row.get(2).unwrap();
+        //
+        // assert_eq!(
+        //     hash,
+        //     String::from("6bf8ee6cd03eac57b7039756edc58c4aed6f6882")
+        // );
+        // assert_eq!(msg, "First commit\n");
+        // assert_eq!(when, Utc.ymd(2022, 7, 1).and_hms(17, 55, 57));
 
         Ok(())
     }
