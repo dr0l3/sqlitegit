@@ -57,6 +57,6 @@ ORDER BY ttm ASC;
 - Filter commits and stats based on file names and authors.
 - Analyze merge commit patterns and calculate time-to-merge.
 
-## ⚠️ Known Limitations
+## ⚠️ Limitations
 
 Many!
